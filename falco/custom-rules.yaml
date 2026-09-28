@@ -1,0 +1,101 @@
+# Falco custom rules for homelab cluster
+# Complement the default Falco ruleset with homelab-specific tuning.
+# These rules reduce noise from known-good operations on this cluster
+# and add coverage for patterns not in the defaults.
+#
+# Apply: place in /etc/falco/rules.d/ on each node, then restart Falco.
+
+# Override the default "shell in container" rule to add exceptions
+# for known legitimate use cases on this cluster
+- rule: Shell Spawned in Container
+  desc: A shell was spawned in a container. Investigate unless it matches known exceptions.
+  condition: >
+    spawned_process and
+    container and
+    not container.image.repository in (known_shell_container_images) and
+    proc.name in (shell_binaries) and
+    not proc.pname in (shell_binaries) and
+    not (proc.name = "sh" and proc.pname in ("containerd-shim", "runc"))
+  output: >
+    Shell spawned in container
+    (user=%user.name user_loginuid=%user.loginuid
+    container_id=%container.id container_name=%container.name
+    image=%container.image.repository:%container.image.tag
+    shell=%proc.name parent=%proc.pname cmdline=%proc.cmdline)
+  priority: WARNING
+  tags: [container, shell, cks]
+
+- list: known_shell_container_images
+  items:
+    - busybox
+    - alpine
+    - debug
+
+# Alert on privilege escalation via setuid binaries in containers
+- rule: Setuid Binary Run in Container
+  desc: A setuid binary was executed in a container. This can be a privilege escalation vector.
+  condition: >
+    spawned_process and
+    container and
+    proc.is_suid_exe = true and
+    not proc.name in (known_setuid_binaries_in_containers)
+  output: >
+    Setuid binary executed in container
+    (user=%user.name container=%container.name
+    image=%container.image.repository:%container.image.tag
+    binary=%proc.exepath)
+  priority: ERROR
+  tags: [container, privilege-escalation, cks]
+
+- list: known_setuid_binaries_in_containers
+  items: [ping, su]
+
+# Alert on access to sensitive host paths
+- rule: Container Access to Host /etc
+  desc: A container process accessed /etc on the host (via hostPath mount)
+  condition: >
+    open_read and
+    container and
+    fd.name startswith /etc and
+    not fd.name startswith /etc/hosts and
+    not fd.name startswith /etc/hostname and
+    not fd.name startswith /etc/resolv.conf
+  output: >
+    Container read from host /etc
+    (user=%user.name container=%container.name
+    image=%container.image.repository:%container.image.tag
+    file=%fd.name)
+  priority: WARNING
+  tags: [container, filesystem, cks]
+
+# Detect potential crypto mining (unusual CPU-bound processes)
+- rule: Crypto Miner CPU Signature
+  desc: Process name or arguments matching common crypto miner patterns
+  condition: >
+    spawned_process and
+    (proc.name in (stratum, xmrig, minerd, cpuminer, ethminer) or
+     proc.cmdline contains "--pool" or
+     proc.cmdline contains "stratum+tcp" or
+     proc.cmdline contains "xmr" or
+     proc.cmdline contains "monero")
+  output: >
+    Suspected crypto miner
+    (user=%user.name container=%container.name
+    cmdline=%proc.cmdline)
+  priority: CRITICAL
+  tags: [crypto-miner, cks]
+
+# Alert on Kubernetes API server token reads from unusual locations
+- rule: K8s API Token Read Outside Expected Paths
+  desc: Service account token read from unexpected path (not the projected volume path)
+  condition: >
+    open_read and
+    container and
+    fd.name contains "token" and
+    fd.name startswith "/var/run/secrets/kubernetes.io" and
+    not proc.name in (kubectl, curl, wget, python3, node, java)
+  output: >
+    Service account token read
+    (user=%user.name container=%container.name proc=%proc.name file=%fd.name)
+  priority: WARNING
+  tags: [container, credentials, cks]
